@@ -1,0 +1,24 @@
+{
+  "name": "metadesktop",
+  "version": "0.0.0",
+  "description": "modal keyboard commands for desktop scope",
+  "main": "src/index.coffee",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rdeforest/MetaDesktop.git"
+  },
+  "keywords": [],
+  "author": "Robert de Forest <robert@defore.st>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/rdeforest/MetaDesktop/issues"
+  },
+  "homepage": "https://github.com/rdeforest/MetaDesktop#readme",
+  "dependencies": {
+    "coffeescript": "^2.7.0",
+    "js-yaml": "^4.1.0"
+  }
+}

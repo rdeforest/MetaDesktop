@@ -1,0 +1,460 @@
+#!/usr/bin/env coffee
+# meta-desk - Modular desktop command system
+# Usage: meta-desk [command] [args]
+
+fs = require 'fs'
+path = require 'path'
+{ exec, execSync, spawn } = require 'child_process'
+
+# XDG Base Directory specification
+XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME or path.join(process.env.HOME, '.config')
+XDG_DATA_HOME = process.env.XDG_DATA_HOME or path.join(process.env.HOME, '.local/share')
+
+CONFIG_DIR = path.join(XDG_CONFIG_HOME, 'meta-desk')
+DATA_DIR = path.join(XDG_DATA_HOME, 'meta-desk')
+LOG_DIR = path.join(DATA_DIR, 'logs')
+MODULES_DIR = path.join(DATA_DIR, 'modules')
+
+CONFIG_FILE = path.join(CONFIG_DIR, 'config.yaml')
+STATE_FILE = path.join(DATA_DIR, 'state.json')
+LOCK_FILE = path.join(DATA_DIR, 'meta-desk.lock')
+
+# Capability detection
+detectCapabilities = ->
+  capabilities = {}
+
+  # Terminal emulator
+  for candidate in ['x-terminal-emulator', 'mate-terminal', 'gnome-terminal', 'xfce4-terminal', 'xterm']
+    if commandExists(candidate)
+      capabilities.terminal = candidate
+      break
+
+  # Browser
+  for candidate in ['sensible-browser', 'firefox', 'chromium', 'google-chrome']
+    if commandExists(candidate)
+      capabilities.browser = candidate
+      break
+
+  # Editor
+  capabilities.editor = process.env.EDITOR or 'sensible-editor'
+
+  # Notification system
+  try
+    execSync('notify-send --version', { stdio: 'ignore' })
+    capabilities.notification = 'notify-send'
+  catch
+    capabilities.notification = 'console'
+
+  # Screen locker
+  for candidate in ['mate-screensaver-command', 'xfce4-screensaver-command', 'gnome-screensaver-command', 'xscreensaver-command']
+    if commandExists(candidate)
+      capabilities.screenLocker = candidate
+      break
+
+  capabilities
+
+commandExists = (command) ->
+  try
+    execSync("which #{command}", { stdio: 'ignore' })
+    return true
+  catch
+    return false
+
+# Logging system
+class Logger
+  constructor: (@name) ->
+    @logFile = path.join(LOG_DIR, "#{@name}.log")
+    fs.mkdirSync(LOG_DIR, { recursive: true })
+
+  log: (level, message) ->
+    timestamp = new Date().toISOString()
+    logEntry = "#{timestamp} [#{level.toUpperCase()}] #{message}\n"
+
+    # Write to file
+    fs.appendFileSync(@logFile, logEntry)
+
+    # Also output to console if in debug mode
+    if process.env.DEBUG
+      console.log logEntry.trim()
+
+  info: (message) -> @log('info', message)
+  warn: (message) -> @log('warn', message)
+  error: (message) -> @log('error', message)
+  debug: (message) -> @log('debug', message) if process.env.DEBUG
+
+logger = new Logger('meta-desk')
+
+# Module management
+class ModuleManager
+  constructor: ->
+    @modules = new Map()
+    @capabilities = detectCapabilities()
+    logger.info("Detected capabilities: #{JSON.stringify(@capabilities)}")
+
+  loadModule: (modulePath) ->
+    try
+      manifestPath = path.join(modulePath, 'package.json')
+      unless fs.existsSync(manifestPath)
+        throw new Error("No package.json found in #{modulePath}")
+
+      manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+
+      unless manifest.metaDesk
+        throw new Error("No metaDesk configuration in package.json")
+
+      module = {
+        name: manifest.name
+        version: manifest.version
+        description: manifest.description
+        path: modulePath
+        manifest: manifest
+        metaDesk: manifest.metaDesk
+        capabilities: @capabilities
+      }
+
+      # Validate module
+      @validateModule(module)
+
+      @modules.set(manifest.name, module)
+      logger.info("Loaded module: #{manifest.name} v#{manifest.version}")
+
+      module
+    catch error
+      logger.error("Failed to load module from #{modulePath}: #{error.message}")
+      throw error
+
+  validateModule: (module) ->
+    metaDesk = module.metaDesk
+
+    # Check required fields
+    unless metaDesk.commands
+      throw new Error("Module must define commands")
+
+    # Validate command structure
+    for key, command of metaDesk.commands
+      unless command.description
+        throw new Error("Command '#{key}' must have description")
+
+    # Check dependencies are available
+    if metaDesk.dependencies
+      for dep in metaDesk.dependencies
+        unless @modules.has(dep)
+          logger.warn("Module dependency '#{dep}' not loaded")
+
+  discoverModules: ->
+    modulePaths = []
+
+    # Built-in modules directory
+    if fs.existsSync(MODULES_DIR)
+      for item in fs.readdirSync(MODULES_DIR)
+        modulePath = path.join(MODULES_DIR, item)
+        if fs.statSync(modulePath).isDirectory()
+          modulePaths.push(modulePath)
+
+    # Look for modules in current directory structure
+    currentDir = process.cwd()
+    possiblePaths = [
+      path.join(currentDir, 'modules'),
+      path.join(currentDir, '..', 'modules'),
+      path.join(currentDir, 'node_modules')
+    ]
+
+    for basePath in possiblePaths
+      if fs.existsSync(basePath)
+        for item in fs.readdirSync(basePath)
+          if item.startsWith('metadesk-')
+            modulePath = path.join(basePath, item)
+            if fs.statSync(modulePath).isDirectory()
+              modulePaths.push(modulePath)
+
+    logger.info("Discovered module paths: #{modulePaths.join(', ')}")
+    modulePaths
+
+  loadAllModules: ->
+    modulePaths = @discoverModules()
+
+    for modulePath in modulePaths
+      try
+        @loadModule(modulePath)
+      catch error
+        logger.error("Skipping invalid module at #{modulePath}: #{error.message}")
+
+  getCommands: ->
+    commands = {}
+
+    for [name, module] of @modules
+      for key, command of module.metaDesk.commands
+        if commands[key]
+          logger.warn("Command key '#{key}' conflicts between modules")
+
+        commands[key] = {
+          key: key
+          description: command.description
+          module: name
+          handler: command.handler
+          submenu: command.submenu
+          command: command.command
+        }
+
+    commands
+
+  executeCommand: (moduleName, commandPath, args = []) ->
+    module = @modules.get(moduleName)
+    unless module
+      throw new Error("Module '#{moduleName}' not found")
+
+    # Find the command handler
+    handler = module.metaDesk.commands[commandPath[0]]?.handler
+    if handler
+      handlerPath = path.join(module.path, handler)
+      if fs.existsSync(handlerPath)
+        # Execute handler script
+        spawn(handlerPath, args, {
+          stdio: 'inherit',
+          env: { ...process.env, META_DESK_CAPABILITIES: JSON.stringify(@capabilities) }
+        })
+      else
+        throw new Error("Handler not found: #{handlerPath}")
+    else
+      throw new Error("No handler for command: #{commandPath.join(' ')}")
+
+moduleManager = new ModuleManager()
+
+# State management (simplified from previous version)
+class MetaDeskState
+  constructor: ->
+    @current_path = []
+    @timeout_id = null
+    @start_time = Date.now()
+
+  reset: ->
+    @current_path = []
+    @clearTimeout()
+
+  addKey: (key) ->
+    @current_path.push(key)
+    @start_time = Date.now()
+
+  getCurrentPath: ->
+    @current_path.join('')
+
+  setTimeout: (callback, delay) ->
+    @clearTimeout()
+    @timeout_id = setTimeout(callback, delay)
+
+  clearTimeout: ->
+    if @timeout_id
+      clearTimeout(@timeout_id)
+      @timeout_id = null
+
+state = new MetaDeskState()
+
+# Configuration management
+loadConfig = ->
+  try
+    if fs.existsSync(CONFIG_FILE)
+      yaml = require('js-yaml')
+      configText = fs.readFileSync(CONFIG_FILE, 'utf8')
+      yaml.load(configText)
+    else
+      # Default configuration
+      {
+        timeout_ms: 5000
+        notification_timeout: 3000
+        modules: []
+      }
+  catch error
+    logger.error("Error loading config: #{error.message}")
+    {}
+
+saveConfig = (config) ->
+  try
+    yaml = require('js-yaml')
+    fs.mkdirSync(CONFIG_DIR, { recursive: true })
+    configText = yaml.dump(config, { indent: 2 })
+    fs.writeFileSync(CONFIG_FILE, configText)
+    true
+  catch error
+    logger.error("Error saving config: #{error.message}")
+    false
+
+# Notification system
+showNotification = (message, isError = false) ->
+  capabilities = moduleManager.capabilities
+
+  if capabilities.notification is 'notify-send'
+    urgency = if isError then 'critical' else 'normal'
+    icon = if isError then 'dialog-error' else 'dialog-information'
+    exec("notify-send --urgency=#{urgency} --icon=#{icon} 'MetaDesk' '#{message}'")
+  else
+    prefix = if isError then 'ERROR:' else 'INFO:'
+    console.log("#{prefix} #{message}")
+
+# Command processing
+processKey = (key) ->
+  config = loadConfig()
+  commands = moduleManager.getCommands()
+
+  state.addKey(key)
+  currentPath = state.current_path
+
+  # Try to find command
+  current = commands
+  validPath = true
+
+  for pathKey in currentPath
+    if current[pathKey]
+      if current[pathKey].submenu
+        current = current[pathKey].submenu
+      else if current[pathKey].command
+        # Found complete command
+        try
+          if current[pathKey].module
+            moduleManager.executeCommand(current[pathKey].module, currentPath)
+          else
+            exec(current[pathKey].command)
+          showNotification("Executed: #{current[pathKey].description}")
+        catch error
+          logger.error("Command execution failed: #{error.message}")
+          showNotification("Command failed: #{error.message}", true)
+
+        state.reset()
+        return
+      else
+        validPath = false
+        break
+    else
+      validPath = false
+      break
+
+  if validPath
+    # Valid partial path, show status
+    options = Object.keys(current).slice(0, 5).join(', ')
+    moreCount = Math.max(0, Object.keys(current).length - 5)
+    optionsText = if moreCount > 0 then "#{options} (+#{moreCount} more)" else options
+
+    showNotification("#{currentPath.join(' → ')} [#{optionsText}]")
+
+    # Set timeout
+    state.setTimeout ->
+      showNotification("Command timeout", true)
+      state.reset()
+    , config.timeout_ms
+  else
+    # Invalid path
+    showNotification("Invalid command: #{currentPath.join('')}", true)
+    state.reset()
+
+# Command implementations
+commands =
+  start: ->
+    logger.info("Starting MetaDesk")
+
+    # Load modules
+    moduleManager.loadAllModules()
+
+    # Check if already running
+    if fs.existsSync(LOCK_FILE)
+      console.log("MetaDesk already running")
+      return
+
+    # Create lock file
+    fs.writeFileSync(LOCK_FILE, process.pid.toString())
+
+    state.reset()
+    showNotification("MetaDesk activated")
+
+    # Cleanup on exit
+    process.on 'exit', ->
+      try
+        fs.unlinkSync(LOCK_FILE)
+      catch
+        # Ignore
+
+    ['SIGINT', 'SIGTERM'].forEach (signal) ->
+      process.on signal, -> process.exit(0)
+
+  key: (args) ->
+    if args.length is 0
+      console.error "Key required"
+      return
+
+    processKey(args[0])
+
+  install: (args) ->
+    if args.length is 0
+      console.error "Module path or URL required"
+      return
+
+    target = args[0]
+
+    if fs.existsSync(target) and fs.statSync(target).isDirectory()
+      # Local directory
+      try
+        module = moduleManager.loadModule(target)
+        config = loadConfig()
+        config.modules = config.modules or []
+        config.modules.push(target)
+        saveConfig(config)
+        console.log("Installed module: #{module.name}")
+      catch error
+        console.error("Failed to install module: #{error.message}")
+    else if target.match(/^https?:\/\//)
+      # URL - for future implementation
+      console.log("URL installation not yet implemented")
+    else
+      console.error("Invalid module path or URL")
+
+  modules: ->
+    console.log("Loaded modules:")
+    for [name, module] of moduleManager.modules
+      console.log("  #{name} v#{module.version} - #{module.description}")
+
+  config: ->
+    editor = moduleManager.capabilities.editor
+    spawn(editor, [CONFIG_FILE], { stdio: 'inherit' })
+
+  help: ->
+    console.log """
+    meta-desk - Modular desktop command system
+
+    COMMANDS:
+      start           Activate meta command mode
+      key <k>         Process a key press
+      install <path>  Install module from directory
+      modules         List loaded modules
+      config          Edit configuration
+      help            Show this help
+
+    USAGE:
+      1. Run 'meta-desk start' to activate
+      2. Press Super+A (configured via desktop environment)
+      3. Type command sequences based on loaded modules
+      4. Commands execute when complete sequence is entered
+    """
+
+# Main execution
+main = ->
+  # Ensure directories exist
+  fs.mkdirSync(CONFIG_DIR, { recursive: true })
+  fs.mkdirSync(DATA_DIR, { recursive: true })
+  fs.mkdirSync(LOG_DIR, { recursive: true })
+
+  args = process.argv.slice(2)
+
+  if args.length is 0
+    commands.help()
+    return
+
+  command = args[0]
+  commandArgs = args.slice(1)
+
+  if commands[command]
+    commands[command](commandArgs)
+  else
+    console.error("Unknown command: #{command}")
+    commands.help()
+
+main() if require.main is module
+
+module.exports = { ModuleManager, MetaDeskState, commands }
