@@ -144,6 +144,23 @@ class ModuleManager
   discoverModules: ->
     modulePaths = []
 
+    # Load modules from config file FIRST
+    config = loadConfig()
+    if config.modules?.length > 0
+      configDir = path.dirname(CONFIG_FILE)
+      for modulePath in config.modules
+        # Resolve relative paths from config directory
+        resolvedPath = if path.isAbsolute(modulePath)
+          modulePath
+        else
+          path.resolve(configDir, modulePath)
+
+        if fs.existsSync(resolvedPath) and fs.statSync(resolvedPath).isDirectory()
+          modulePaths.push(resolvedPath)
+          logger.info("Added module from config: #{resolvedPath}")
+        else
+          logger.warn("Module path from config not found: #{resolvedPath}")
+
     # Built-in modules directory
     if fs.existsSync(MODULES_DIR)
       for item in fs.readdirSync(MODULES_DIR)
@@ -162,7 +179,7 @@ class ModuleManager
     for basePath in possiblePaths
       if fs.existsSync(basePath)
         for item in fs.readdirSync(basePath)
-          if item.startsWith('metadesk-')
+          if item.startsWith('metadesk-') or item.startsWith('meta-desk-')
             modulePath = path.join(basePath, item)
             if fs.statSync(modulePath).isDirectory()
               modulePaths.push(modulePath)
@@ -182,7 +199,7 @@ class ModuleManager
   getCommands: ->
     commands = {}
 
-    for [name, module] of @modules
+    for [name, module] from @modules
       for key, command of module.metaDesk.commands
         if commands[key]
           logger.warn("Command key '#{key}' conflicts between modules")
@@ -298,52 +315,56 @@ processKey = (key) ->
   state.addKey(key)
   currentPath = state.current_path
 
-  # Try to find command
+  # Build the current command path
   current = commands
-  validPath = true
+  for i in [0...currentPath.length]
+    pathKey = currentPath[i]
 
-  for pathKey in currentPath
     if current[pathKey]
-      if current[pathKey].submenu
-        current = current[pathKey].submenu
-      else if current[pathKey].command
-        # Found complete command
-        try
-          if current[pathKey].module
-            moduleManager.executeCommand(current[pathKey].module, currentPath)
-          else
+      if i == currentPath.length - 1
+        # This is the final key in the path
+        if current[pathKey].command
+          # Execute the command
+          try
+            logger.info("Executing command: #{current[pathKey].command}")
             exec(current[pathKey].command)
-          showNotification("Executed: #{current[pathKey].description}")
-        catch error
-          logger.error("Command execution failed: #{error.message}")
-          showNotification("Command failed: #{error.message}", true)
+            showNotification("Executed: #{current[pathKey].description}")
+          catch error
+            logger.error("Command execution failed: #{error.message}")
+            showNotification("Command failed: #{error.message}", true)
 
-        state.reset()
-        return
+          state.reset()
+          return
+        else if current[pathKey].submenu
+          # Show submenu options
+          current = current[pathKey].submenu
+          options = Object.keys(current).slice(0, 5).join(', ')
+          moreCount = Math.max(0, Object.keys(current).length - 5)
+          optionsText = if moreCount > 0 then "#{options} (+#{moreCount} more)" else options
+
+          showNotification("#{current[pathKey].description} [#{optionsText}]")
+
+          # Set timeout
+          state.setTimeout ->
+            showNotification("Command timeout", true)
+            state.reset()
+          , config.timeout_ms
+        else
+          # Invalid command structure
+          showNotification("Invalid command: #{currentPath.join('')}", true)
+          state.reset()
       else
-        validPath = false
-        break
+        # Navigate to submenu
+        if current[pathKey].submenu
+          current = current[pathKey].submenu
+        else
+          showNotification("Invalid command: #{currentPath.join('')}", true)
+          state.reset()
+          return
     else
-      validPath = false
-      break
-
-  if validPath
-    # Valid partial path, show status
-    options = Object.keys(current).slice(0, 5).join(', ')
-    moreCount = Math.max(0, Object.keys(current).length - 5)
-    optionsText = if moreCount > 0 then "#{options} (+#{moreCount} more)" else options
-
-    showNotification("#{currentPath.join(' → ')} [#{optionsText}]")
-
-    # Set timeout
-    state.setTimeout ->
-      showNotification("Command timeout", true)
+      showNotification("Invalid command: #{currentPath.join('')}", true)
       state.reset()
-    , config.timeout_ms
-  else
-    # Invalid path
-    showNotification("Invalid command: #{currentPath.join('')}", true)
-    state.reset()
+      return
 
 # Command implementations
 commands =
@@ -407,8 +428,52 @@ commands =
 
   modules: ->
     console.log("Loaded modules:")
-    for [name, module] of moduleManager.modules
+    for [name, module] from moduleManager.modules
       console.log("  #{name} v#{module.version} - #{module.description}")
+
+  status: ->
+    config = loadConfig()
+    capabilities = moduleManager.capabilities
+
+    console.log("=== MetaDesk Status ===")
+    console.log("Config directory: #{CONFIG_DIR}")
+    console.log("Data directory: #{DATA_DIR}")
+    console.log("Lock file exists: #{fs.existsSync(LOCK_FILE)}")
+
+    console.log("\n=== Capabilities ===")
+    for key, value of capabilities
+      console.log("  #{key}: #{value}")
+
+    console.log("\n=== Loaded Modules ===")
+    if moduleManager.modules.size > 0
+      for name, module of moduleManager.modules
+        console.log("  #{name} v#{module.version}")
+    else
+      console.log("  No modules loaded")
+
+    console.log("\n=== Available Commands ===")
+    commands = moduleManager.getCommands()
+    if Object.keys(commands).length > 0
+      for key, command of commands
+        console.log("  #{key} - #{command.description} (#{command.module})")
+    else
+      console.log("  No commands available")
+
+    console.log """
+        \n=== Key Binding Setup ===")
+        To activate MetaDesk with Super+A, run:
+          # For MATE:
+          gsettings set org.mate.SettingsDaemon.plugins.media-keys.custom-keybinding:/org/mate/settings-daemon/plugins/media-keys/custom-keybindings/custom0/ name 'MetaDesk'
+          gsettings set org.mate.SettingsDaemon.plugins.media-keys.custom-keybinding:/org/mate/settings-daemon/plugins/media-keys/custom-keybindings/custom0/ command 'meta-desk key a'
+          gsettings set org.mate.SettingsDaemon.plugins.media-keys.custom-keybinding:/org/mate/settings-daemon/plugins/media-keys/custom-keybindings/custom0/ binding '<Super>a'
+      """
+
+    if state.current_path.length > 0
+      console.log("\n=== Current State ===")
+      console.log("Current path: #{state.current_path.join(' → ')}")
+    else if fs.existsSync(LOCK_FILE)
+      console.log("\n=== Current State ===")
+      console.log("MetaDesk is running and ready for input")
 
   config: ->
     editor = moduleManager.capabilities.editor
@@ -423,6 +488,7 @@ commands =
       key <k>         Process a key press
       install <path>  Install module from directory
       modules         List loaded modules
+      status          Show system status and setup instructions
       config          Edit configuration
       help            Show this help
 
